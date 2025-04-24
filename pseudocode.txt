@@ -1,0 +1,234 @@
+1. Khởi tạo
+2. Tính vị trí các unknown node theo DV-hop
+3. Với mỗi unknown node, dùng VVS-HCO để tính vị trí
+    1. Khởi tạo 1 quần thể sperm là tập nghiệm của hệ phương trình (random?), check và lấy kq tốt hơn của quần thể hiển tại với opposite
+    2. K iterations (K lần di chuyển của quần thể sperm)
+        initial_best: trung bình k_best vị trí tốt nhất của các iteration trước
+        k_best = N-(N-2)\sqrt(\frac{k}{k_max}) : giảm dần, tiến gần về 2 khi tiến tới iteration cuối
+        f(k): kiểm soát sự ảnh hưởng của initial_best, khi k tăng thì ảnh hưởng đến công thức vận tốc giảm (k->0)
+
+        SPpbest[j] là vị trí tốt nhất với sperm[j] ở các iteration trước
+        SPgbest là vị trí tốt nhất với tất cả sperm ở các iteration trước
+
+        velocities[j]: công thức vận tốc/gia tốc của tinh trùng j ở iteration tiếp theo (hướng di chuyển của sperm[j])
+        
+
+
+DV-hop: tính vị trí có thể của các unknown node
+PSO: 1 đàn đi tìm 1 vị trí tốt nhất (đánh giá bằng hàm fitness)
+    c1, c2 cố định 
+    c1: niềm tin của 1 swarm vào vị trí tốt nhất của nó
+    c2: niềm tin của 1 swarm vào vị trí tốt nhất của cả đàn
+    r1, r2: random
+    w: quán tính (sự ảnh hưởng của tốc độ cũ đến tốc độ hiện tại)
+HCO: (1 phiên bản của PSO?)
+    c1, c2 giống nhau? (giá trị tăng từ 1+1.5*(1-e) -> 2.5)
+VVS-HCO: bổ sung thêm initial_best (ảnh hơngr của k vị trí sperm tốt nhất)
+    trạng thái ban đầu là random
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+'''
+import numpy as np
+from scipy.spatial.distance import cdist
+
+# ----------------------------
+# Network generation routines
+# ----------------------------
+
+def generate_network(num_nodes, area_size, comm_range, anchor_ratio=0.1):
+    coords = np.random.rand(num_nodes, 2) * area_size
+    num_anchors = max(int(anchor_ratio * num_nodes), 3)
+    anchors_idx = np.random.choice(num_nodes, num_anchors, replace=False)
+    return coords, anchors_idx
+
+
+def compute_hop_counts(coords, comm_range, anchors_idx):
+    N = coords.shape[0]
+    dist = cdist(coords, coords)
+    adj = (dist <= comm_range).astype(int)
+    hop_counts = np.full((len(anchors_idx), N), np.inf)
+    for i, a in enumerate(anchors_idx):
+        hops = np.full(N, np.inf)
+        hops[a] = 0
+        frontier = {a}
+        step = 0
+        while frontier:
+            next_front = set()
+            for u in frontier:
+                for v in np.where(adj[u])[0]:
+                    if hops[v] == np.inf:
+                        hops[v] = step + 1
+                        next_front.add(v)
+            frontier = next_front
+            step += 1
+        hop_counts[i] = hops
+    return hop_counts
+
+# ----------------------------
+# DV-Hop estimation routines
+# ----------------------------
+
+def dvhop_estimate(coords, anchors_idx, hop_counts):
+    A, N = hop_counts.shape
+    anchor_coords = coords[anchors_idx]
+    HpSz = np.zeros(A)
+    for i in range(A):
+        others = np.delete(np.arange(A), i)
+        num, den = 0.0, 0.0
+        for j in others:
+            true_d = np.linalg.norm(anchor_coords[i] - anchor_coords[j])
+            h = hop_counts[i, anchors_idx[j]]
+            if np.isfinite(h) and h > 0:
+                num += true_d
+                den += h
+        HpSz[i] = num / den if den > 0 else 0.0
+    hop_finite = np.where(np.isfinite(hop_counts), hop_counts, 0.0)
+    d_est = HpSz[:, None] * hop_finite
+    return d_est
+
+# ----------------------------
+# VVS-HCO optimizer with per-sperm pbest and global gbest
+# ----------------------------
+class VVSHCO_Optimizer:
+    def __init__(self, obj_fn, bounds, pop_size=50, max_iters=200):
+        self.obj_fn = obj_fn
+        self.bounds = np.array(bounds)
+        self.pop = pop_size
+        self.dim = bounds.shape[0]
+        self.max_iters = max_iters
+
+    def optimize(self):
+        # Initialize population X and opposite Xopp
+        X = np.random.uniform(self.bounds[:,0], self.bounds[:,1], (self.pop, self.dim))
+        Xopp = self.bounds[:,0] + self.bounds[:,1] - X
+        # Evaluate fitness
+        F = np.apply_along_axis(self.obj_fn, 1, X)
+        Fopp = np.apply_along_axis(self.obj_fn, 1, Xopp)
+        F = np.nan_to_num(F, nan=np.inf)
+        Fopp = np.nan_to_num(Fopp, nan=np.inf)
+        # Healthy selection: choose better of X and Xopp
+        mask = F > Fopp
+        X[mask] = Xopp[mask]
+        F[mask] = Fopp[mask]
+        # Initialize personal bests (pbest) and global best
+        pbest_pos = X.copy()
+        pbest_val = F.copy()
+        g_idx = np.argmin(pbest_val)
+        gbest_pos = pbest_pos[g_idx].copy()
+        gbest_val = pbest_val[g_idx]
+
+        # Hyperparameters
+        wg1_min, wg1_max = 0.4, 0.9
+        gamma, eta = 0.5, 0.5
+        Ra = 0.1 * np.sqrt(np.sum((self.bounds[:,1] - self.bounds[:,0])**2) / self.pop)
+        velocities = np.zeros_like(X)
+
+        # Main iteration loop
+        for k in range(self.max_iters):
+            jc = k + 1
+            # Dynamic coefficients c1, c2
+            c1 = c2 = 1 + 1.5 * (1 - np.exp(-jc / 600.0))
+            # Inertia weight
+            wg1 = wg1_min + (k / self.max_iters) * (wg1_max - wg1_min)
+            # Dynamic k_best for Initialbest
+            k_best = int(self.pop - (self.pop - 2) * np.sqrt(jc / self.max_iters))
+            idx_sorted = np.argsort(pbest_val)
+            Initialbest = pbest_pos[idx_sorted[:k_best]].mean(axis=0)
+            # Fitness stats
+            favg = np.nanmean(pbest_val)
+            fbest = np.nanmin(pbest_val)
+            denom = 4 * eta * (fbest - favg) + 1e-9
+            eps = gamma * ((fbest - pbest_val)**2 - (favg - pbest_val)**2) / denom
+            eps = np.nan_to_num(eps, nan=0.0, posinf=0.0, neginf=0.0)
+
+            for j in range(self.pop):
+                # Update velocity using personal best and global best
+                b1 = pbest_pos[j] - X[j]
+                b2 = gbest_pos - X[j]
+                v = (
+                    wg1 * (velocities[j] + eps[j])
+                    + c1 * b1 * np.sin(2 * np.pi * jc / self.max_iters)
+                    + c2 * b2 * np.sin(2 * np.pi * jc / self.max_iters)
+                    + (1 - 0.1 * jc) * (Initialbest - (X[j] + (1 - 0.1 * jc) * Ra * np.random.uniform(-1,1,self.dim)))
+                )
+                velocities[j] = v
+                X[j] = np.clip(X[j] + v, self.bounds[:,0], self.bounds[:,1])
+                Fj = self.obj_fn(X[j])
+                # Update personal best
+                if Fj < pbest_val[j]:
+                    pbest_val[j] = Fj
+                    pbest_pos[j] = X[j].copy()
+
+            # Update global best
+            g_idx = np.argmin(pbest_val)
+            gbest_pos = pbest_pos[g_idx].copy()
+            gbest_val = pbest_val[g_idx]
+
+        return gbest_pos, gbest_val
+
+# ----------------------------
+# DV-Hop + VVS-HCO localization
+# ----------------------------
+def dvhop_vvshco(coords, anchors_idx, comm_range):
+    N = coords.shape[0]
+    hop_counts = compute_hop_counts(coords, comm_range, anchors_idx)
+    d_est = dvhop_estimate(coords, anchors_idx, hop_counts)
+    estimated = np.zeros_like(coords)
+
+    for u in range(N):
+        if u in anchors_idx:
+            estimated[u] = coords[u]
+            continue
+        hopvals = hop_counts[:, u]
+        def obj_fn(x):
+            d_true = np.linalg.norm(x - coords[anchors_idx], axis=1)
+            errors = np.abs(d_true - d_est[:, u])
+            f_val = np.sum(errors)
+            w = np.sum((1.0 / hopvals)**2) if np.all(hopvals>0) else 0.0
+            return w * f_val
+
+        bounds = np.array([[0, coords[:,0].max()], [0, coords[:,1].max()]])
+        opt = VVSHCO_Optimizer(obj_fn, bounds)
+        best_pos, _ = opt.optimize()
+        estimated[u] = best_pos
+    return estimated
+
+# ----------------------------
+# Example usage and comparison
+# ----------------------------
+if __name__ == "__main__":
+    num_nodes = 100
+    area = 100
+    comm_r = 15
+    coords, anchors = generate_network(num_nodes, area, comm_r)
+    est_positions = dvhop_vvshco(coords, anchors, comm_r)
+    print("Anchors indices:", anchors)
+    print("Estimated positions for all nodes:\n", est_positions)
+    errors = np.linalg.norm(est_positions - coords, axis=1)
+    for idx, err in enumerate(errors):
+        print(f"Node {idx:3d}: actual {coords[idx]} vs estimated {est_positions[idx]}, error = {err:.3f}")
+    print(f"Average localization error: {np.nanmean(errors):.3f}")
+'''
